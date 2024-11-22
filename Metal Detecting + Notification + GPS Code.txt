@@ -1,0 +1,157 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+
+// Define Bluetooth and GPS objects
+SoftwareSerial btSerial(10, 11); // RX, TX for Bluetooth
+TinyGPSPlus gps;
+
+// Pin and constant definitions
+const byte npulse = 12;       // Number of pulses to charge the capacitor before each measurement
+const byte pin_pulse = A0;    // Sends pulses to charge the capacitor (can be a digital pin)
+const byte pin_cap = A1;      // Measures the capacitor charge
+const byte pin_LED = 12;      // LED pin
+const byte pin_buzzer = 9;    // Buzzer pin
+bool metalDetected = false;   // Flag to indicate metal detection
+
+void setup() {
+    // Initialize pin modes
+    pinMode(pin_pulse, OUTPUT);
+    digitalWrite(pin_pulse, LOW);
+    pinMode(pin_cap, INPUT);
+    pinMode(pin_LED, OUTPUT);
+    digitalWrite(pin_LED, LOW);
+    pinMode(pin_buzzer, OUTPUT);
+    digitalWrite(pin_buzzer, LOW);
+
+    // Initialize Serial communication
+    Serial.begin(115200);
+    btSerial.begin(9600); // Bluetooth baud rate
+
+    Serial.println("Setup complete. Waiting for metal detection...");
+}
+
+// Variables for measurements
+const int nmeas = 256;        // Number of measurements to take
+long int sumsum = 0;          // Running sum of 64 sums
+long int skip = 0;            // Number of skipped sums
+long int diff = 0;            // Difference between sum and average sum
+long int flash_period = 0;    // Period (in ms) for LED flashes
+long unsigned int prev_flash = 0; // Time stamp of previous flash
+
+void loop() {
+    int minval = 2000;
+    int maxval = 0;
+    long unsigned int sum = 0;
+
+    // Perform measurements
+    for (int imeas = 0; imeas < nmeas + 2; imeas++) {
+        // Reset the capacitor
+        pinMode(pin_cap, OUTPUT);
+        digitalWrite(pin_cap, LOW);
+        delayMicroseconds(20);
+        pinMode(pin_cap, INPUT);
+
+        // Apply pulses to charge the capacitor
+        for (int ipulse = 0; ipulse < npulse; ipulse++) {
+            digitalWrite(pin_pulse, HIGH);
+            delayMicroseconds(3);
+            digitalWrite(pin_pulse, LOW);
+            delayMicroseconds(3);
+        }
+
+        // Read the charge on the capacitor
+        int val = analogRead(pin_cap);
+        minval = min(val, minval);
+        maxval = max(val, maxval);
+        sum += val;
+    }
+
+    // Subtract minimum and maximum values to remove spikes
+    sum -= minval;
+    sum -= maxval;
+
+    // Process the sum
+    if (sumsum == 0) sumsum = sum << 6; // Initialize sumsum if it's 0
+    long int avgsum = (sumsum + 32) >> 6;
+    diff = sum - avgsum;
+
+    if (abs(diff) < avgsum >> 10) { // Adjust for small changes
+        sumsum = sumsum + sum - avgsum;
+        skip = 0;
+    } else {
+        skip++;
+    }
+
+    if (skip > 64) { // Reset if skipping is prolonged
+        sumsum = sum << 6;
+        skip = 0;
+    }
+
+    // Calculate LED flash period based on diff value
+    if (diff == 0)
+        flash_period = 1000000;
+    else
+        flash_period = avgsum / (2 * abs(diff));
+
+    // Control LED and buzzer based on flash period and diff value
+    long unsigned int timestamp = millis();
+    bool isMetalDetected = false;
+
+    if (timestamp < prev_flash + 12) {
+        if (diff > 0) {
+            isMetalDetected = true;
+        }
+    }
+
+    if (timestamp > prev_flash + flash_period) {
+        if (diff > 0) {
+            isMetalDetected = true;
+            prev_flash = timestamp;
+        }
+    }
+
+    if (flash_period > 1000) {
+        isMetalDetected = false;
+    }
+
+    if (isMetalDetected) {
+        digitalWrite(pin_LED, HIGH); // Turn on LED
+        digitalWrite(pin_buzzer, HIGH); // Turn on buzzer
+
+        // Send notification only once per detection
+        if (!metalDetected) {
+            sendNotification();
+            metalDetected = true;
+        }
+    } else {
+        digitalWrite(pin_LED, LOW); // Turn off LED
+        digitalWrite(pin_buzzer, LOW); // Turn off buzzer
+        metalDetected = false;
+    }
+
+    // Process GPS data
+    while (btSerial.available() > 0) {
+        gps.encode(btSerial.read());
+    }
+
+    delay(100); // Adjust delay as necessary for your application
+}
+
+// Function to send a notification via Bluetooth
+void sendNotification() {
+    if (gps.location.isValid()) {
+        float latitude = gps.location.lat();
+        float longitude = gps.location.lng();
+
+        // Format location data
+        String location = "Lat: " + String(latitude, 6) + ", Long: " + String(longitude, 6);
+        String data = "Metal detected at:\n" + location;
+
+        // Send notification and Google Maps link via Bluetooth
+        btSerial.println(data);
+        String mapsLink = "https://www.google.com/maps?q=" + String(latitude, 6) + "," + String(longitude, 6);
+        btSerial.println("View on Google Maps: " + mapsLink);
+    } else {
+        btSerial.println("Metal detected, but GPS data not available.");
+    }
+}
